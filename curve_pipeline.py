@@ -245,7 +245,10 @@ def build_deadline_market_universe(
     if universe.empty:
         return universe
 
-    universe = universe.drop_duplicates(subset=["event_id", "deadline_date"], keep="first")
+    # When multiple markets map to the same (event_id, deadline_date), keep the *last* so we
+    # tend to get the more specific market (e.g. "by December 31, 2025") rather than a
+    # vaguer one (e.g. "by end of 2025") that may have wrong/stale CLOB data.
+    universe = universe.drop_duplicates(subset=["event_id", "deadline_date"], keep="last")
 
     distinct_counts = (
         universe.groupby(["event_id", "question"], dropna=False)["deadline_date"]
@@ -383,6 +386,58 @@ def build_history_panel(
     ).dt.days.clip(lower=1)
     panel = panel.sort_values(["event_id", "timestamp", "deadline_date"]).reset_index(drop=True)
     return panel
+
+
+def _last_monotonic_index_series(p: np.ndarray) -> int:
+    """Last index (inclusive) such that p is non-decreasing. Returns len(p)-1 if all good."""
+    if len(p) <= 1:
+        return len(p) - 1
+    for i in range(1, len(p)):
+        if p[i] < p[i - 1]:
+            return i - 1
+    return len(p) - 1
+
+
+def truncate_panel_to_monotonic(panel: pd.DataFrame) -> pd.DataFrame:
+    """For each (event_id, timestamp), drop rows after the first decrease in probability_yes
+    (when ordered by deadline_date). Use this so the algo never sees invalid long-dated prices."""
+    if panel.empty:
+        return panel
+    rows: List[pd.DataFrame] = []
+    for (eid, ts), grp in panel.groupby(["event_id", "timestamp"], dropna=False):
+        grp = grp.sort_values("deadline_date").reset_index(drop=True)
+        p = grp["probability_yes"].values.astype(float)
+        k = _last_monotonic_index_series(p)
+        rows.append(grp.iloc[: k + 1])
+    return pd.concat(rows, ignore_index=True)
+
+
+def report_non_monotonic_slices(
+    panel: pd.DataFrame,
+    max_report: int = 20,
+) -> pd.DataFrame:
+    """Report (event_id, timestamp, deadline_date, yes_token_id, prob, prev_prob) where
+    probability_yes first decreases vs previous tenor. Use to investigate wrong/stale long-dated data."""
+    out: List[dict] = []
+    for (eid, ts), grp in panel.groupby(["event_id", "timestamp"], dropna=False):
+        grp = grp.sort_values("deadline_date").reset_index(drop=True)
+        p = grp["probability_yes"].values.astype(float)
+        for i in range(1, len(p)):
+            if p[i] < p[i - 1]:
+                row = grp.iloc[i]
+                out.append({
+                    "event_id": eid,
+                    "timestamp": ts,
+                    "deadline_date": row["deadline_date"],
+                    "tau_days": row["tau_days"],
+                    "yes_token_id": row.get("yes_token_id"),
+                    "probability_yes": float(p[i]),
+                    "prev_probability_yes": float(p[i - 1]),
+                })
+                if len(out) >= max_report:
+                    return pd.DataFrame(out)
+                break
+    return pd.DataFrame(out)
 
 
 # ── Static dislocation signal (time-shifted, cross-sectionally demeaned) ──
@@ -622,6 +677,7 @@ def build_trades_static_dislocation(
     max_weight_per_leg: Optional[float] = None,
     max_gross_hedge: Optional[float] = None,
     max_match_lag_seconds: int = 7200,
+    shares_per_trade: Optional[float] = None,
 ) -> pd.DataFrame:
     """Build trades with 1-bar entry/exit delay and controlled re-entry.
 
@@ -629,11 +685,15 @@ def build_trades_static_dislocation(
     - Entries/exits are executed one bar after signal timestamps.
     - At most one concurrent trade per event, and one per (event, deadline) pair.
     - Hedge fills use backward-only timestamp matching (no future peeking).
+    - If shares_per_trade is set (e.g. 500), PnLs are scaled to dollar PnL assuming
+      that many shares per trade (1 share ≈ $1 at resolution). Columns shares and
+      spread_pnl_dollars are always present; when shares_per_trade is None, shares=1.
     """
+    mult = 1.0 if shares_per_trade is None else float(shares_per_trade)
     cols = [
         "event", "event_id", "entry_ts", "exit_ts", "hold_time", "spread_type",
         "status", "dis_node", "dis_entry", "dis_exit", "dis_pnl", "hedge_legs",
-        "hedge_pnl", "spread_pnl", "static_resid", "n_nodes",
+        "hedge_pnl", "spread_pnl", "spread_pnl_dollars", "shares", "static_resid", "n_nodes",
     ]
     if signals_df.empty or panel.empty or static_signal_df.empty:
         return pd.DataFrame(columns=cols)
@@ -851,6 +911,8 @@ def build_trades_static_dislocation(
                 "hedge_legs": hedge_summary,
                 "hedge_pnl": round(float(sum(l["pnl"] for l in legs)), 4),
                 "spread_pnl": round(total_pnl, 4),
+                "spread_pnl_dollars": round(total_pnl * mult, 2),
+                "shares": mult,
                 "static_resid": round(float(sig["ts_residual"]), 4),
                 "n_nodes": len(deadlines_local),
             }

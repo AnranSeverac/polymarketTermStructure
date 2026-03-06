@@ -2,9 +2,7 @@
 .cache/
 execution_candidates_latest.csv
 execution_candidates_latest.json
-execution_attempts_latest.csv
-execution_log.jsonl
-cycle_log.jsonl
+logs/
 __pycache__/
 .cursor/
 *.pyc

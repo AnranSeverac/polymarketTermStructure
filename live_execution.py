@@ -47,7 +47,7 @@ FETCH_WORKERS = 16
 STATIC_POLY_DEGREE = 2
 STATIC_MIN_NODES = 2
 STATIC_LAG = 1
-REF_SMOOTH_BARS = 3
+REF_SMOOTH_BARS = 10
 STATIC_THRESHOLD = 0.12
 
 EXCLUDE_POOR_FIT = True
@@ -60,16 +60,22 @@ MAX_GROSS_HEDGE = 5.0
 
 CACHE_DIR = Path(".cache")
 UNIVERSE_CACHE_PATH = CACHE_DIR / "universe.parquet"
-OUTPUT_CSV_PATH = Path("execution_candidates_latest.csv")
-OUTPUT_JSON_PATH = Path("execution_candidates_latest.json")
-EXECUTION_LOG_PATH = Path("execution_log.jsonl")
-CYCLE_LOG_PATH = Path("cycle_log.jsonl")
+LOG_DIR = Path("logs")
+
+# Track starting balance for PnL (since process start) when running live.
+_start_balance: Optional[float] = None
+EXECUTION_LOG_PATH = LOG_DIR / "execution_log.jsonl"
+CYCLE_LOG_PATH = LOG_DIR / "cycle_log.jsonl"
+EXECUTION_ATTEMPTS_PATH = LOG_DIR / "execution_attempts_latest.csv"
 
 # Live execution controls
 MAX_DISLOCATED_SHARES = 500.0
 MIN_EXECUTABLE_SHARES = 1.0
 MAX_FROM_TOP = 0.01
 HEARTBEAT_EVERY_N_RUNS = 3
+
+# Exit: assume we exit when |residual| drops to this (matches backtest EXIT_THRESHOLD).
+EXIT_THRESHOLD = 0.03
 
 
 def top_of_book_liquidity_within_1c(
@@ -383,6 +389,8 @@ def latest_signals(panel: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if static_df.empty:
         return static_df, static_df
 
+    # Signals use CLOB price history (last-trade / API "p"), not top of book or mid.
+    # Execution is at top of book within MAX_FROM_TOP (e.g. 1c); opportunity size uses same.
     latest_ts = static_df.groupby("event_id")["timestamp"].transform("max")
     live_slice = static_df[static_df["timestamp"] == latest_ts].copy()
     live_slice["direction"] = np.where(live_slice["ts_residual"] < 0, "BUY", "SELL")
@@ -490,9 +498,80 @@ def _json_safe(obj: object) -> object:
 
 def _log_execution(payload: dict) -> None:
     payload = {"ts": pd.Timestamp.utcnow().isoformat(), **payload}
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     with EXECUTION_LOG_PATH.open("a") as f:
         f.write(json.dumps(_json_safe(payload)) + "\n")
 
+
+def compute_opportunity_per_candidate(
+    candidates: pd.DataFrame,
+    executor: PolymarketExecutor,
+) -> List[Dict[str, object]]:
+    """For each candidate: max tradeable size (within 1c of top of book), entry price, and
+    estimated gross $ opportunity assuming exit when |residual| drops to EXIT_THRESHOLD.
+    Returns one dict per candidate (same order): max_shares, entry_price_dis, est_gross_dollars.
+    """
+    out: List[Dict[str, object]] = []
+    for _, cand in candidates.iterrows():
+        rec = {"max_shares": 0.0, "entry_price_dis": None, "est_gross_dollars": 0.0}
+        try:
+            dis_token_id = str(cand["dis_token_id"])
+            direction = str(cand["direction"]).upper()
+            dis_side = BUY if direction == "BUY" else SELL
+            resid = abs(float(cand["static_resid"]))
+
+            dis_book = executor.get_order_book(dis_token_id)
+            dis_levels = _book_levels(dis_book, "buy" if dis_side == BUY else "sell")
+            dis_liq = top_of_book_liquidity_within_1c(
+                dis_levels,
+                "buy" if dis_side == BUY else "sell",
+                max_from_top=MAX_FROM_TOP,
+            )
+
+            hedge_by_token_raw = cand["hedge_weights_by_token"]
+            if isinstance(hedge_by_token_raw, str):
+                hedge_by_token = json.loads(hedge_by_token_raw)
+            else:
+                hedge_by_token = dict(hedge_by_token_raw)
+
+            hedge_liq: Dict[str, float] = {}
+            hedge_abs_w: Dict[str, float] = {}
+            for token_id, w in hedge_by_token.items():
+                w = float(w)
+                position_sign = w if direction == "BUY" else -w
+                side = BUY if position_sign > 0 else SELL
+                book = executor.get_order_book(str(token_id))
+                levels = _book_levels(book, "buy" if side == BUY else "sell")
+                liq = top_of_book_liquidity_within_1c(
+                    levels,
+                    "buy" if side == BUY else "sell",
+                    max_from_top=MAX_FROM_TOP,
+                )
+                cap = _cap_price_from_book(book, "buy" if side == BUY else "sell", MAX_FROM_TOP)
+                if cap is None:
+                    liq = 0.0
+                hedge_liq[str(token_id)] = liq
+                hedge_abs_w[str(token_id)] = abs(w)
+
+            q_dis = conservative_spread_size(
+                dislocated_liq=dis_liq,
+                hedge_liq_by_deadline=hedge_liq,
+                hedge_weights_by_deadline=hedge_abs_w,
+                max_dislocated_shares=MAX_DISLOCATED_SHARES,
+            )
+            dis_cap = _cap_price_from_book(
+                dis_book,
+                "buy" if dis_side == BUY else "sell",
+                MAX_FROM_TOP,
+            )
+            rec["max_shares"] = float(q_dis)
+            rec["entry_price_dis"] = float(dis_cap) if dis_cap is not None else None
+            # Gross $: assume exit when |residual| = EXIT_THRESHOLD; profit per share ≈ |resid| - EXIT_THRESHOLD (prob space ≈ $).
+            rec["est_gross_dollars"] = max(0.0, (resid - EXIT_THRESHOLD) * q_dis)
+        except Exception:  # noqa: BLE001
+            pass
+        out.append(rec)
+    return out
 
 def execute_candidates(candidates: pd.DataFrame, executor: PolymarketExecutor) -> pd.DataFrame:
     if candidates.empty:
@@ -638,27 +717,21 @@ def run_once(execute_live: bool = False) -> pd.DataFrame:
     static_df, signals = latest_signals(panel)
     candidates = build_execution_candidates(signals, panel)
 
-    OUTPUT_CSV_PATH.write_text("")
-    if not candidates.empty:
-        candidates_out = candidates.copy()
-        candidates_out["hedge_weights_by_deadline"] = candidates_out["hedge_weights_by_deadline"].map(json.dumps)
-        candidates_out["hedge_weights_by_token"] = candidates_out["hedge_weights_by_token"].map(json.dumps)
-        candidates_out.to_csv(OUTPUT_CSV_PATH, index=False)
-        OUTPUT_JSON_PATH.write_text(candidates.to_json(orient="records", date_format="iso", indent=2))
-    else:
-        OUTPUT_JSON_PATH.write_text("[]")
-
+    # Candidate output is the printed table below; no CSV/JSON files by default.
     executed = pd.DataFrame()
     balance: Dict[str, object] = {}
     first_book: Dict[str, object] = {}
+    opportunity_per_candidate: List[Dict[str, object]] = []
     if execute_live and executor is not None:
         try:
             balance = executor.get_balance()
         except Exception:  # noqa: BLE001
             balance = {"error": "balance_fetch_failed"}
         if not candidates.empty:
+            opportunity_per_candidate = compute_opportunity_per_candidate(candidates, executor)
             executed = execute_candidates(candidates, executor)
-            executed.to_csv("execution_attempts_latest.csv", index=False)
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            executed.to_csv(EXECUTION_ATTEMPTS_PATH, index=False)
             # Snapshot top-of-book for first candidate (dislocated leg only)
             try:
                 row = candidates.iloc[0]
@@ -699,6 +772,7 @@ def run_once(execute_live: bool = False) -> pd.DataFrame:
         "balance": balance,
         "first_candidate_book": first_book if first_book else None,
     }
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     with CYCLE_LOG_PATH.open("a") as f:
         f.write(json.dumps(_json_safe(cycle_entry)) + "\n")
 
@@ -707,18 +781,43 @@ def run_once(execute_live: bool = False) -> pd.DataFrame:
         print(msg, flush=True)
     _out()
     _out(f"--- cycle {now_utc.isoformat()} ---")
+    _out(f"  Loop time: {elapsed:.2f}s")
     _out(
         f"  universe={len(universe)}  panel_rows={len(panel)}  "
-        f"signals={len(signals)}  candidates={len(candidates)}  elapsed_s={elapsed:.2f}"
+        f"signals={len(signals)}  candidates={len(candidates)}"
     )
     if not candidates.empty:
         _out("  candidates (algo output):")
         for i, (_, row) in enumerate(candidates.head(15).iterrows(), 1):
-            q = str(row.get("question", ""))[:60] + ("..." if len(str(row.get("question", ""))) > 60 else "")
-            _out(
-                f"    {i}. [{row['direction']}] |resid|={abs(float(row['static_resid'])):.4f} "
-                f"nodes={int(row['n_nodes'])}  {q}"
-            )
+            q = str(row.get("question", ""))[:55] + ("..." if len(str(row.get("question", ""))) > 55 else "")
+            direction = str(row["direction"]).upper()
+            dis_node = str(row["dis_node"])
+            resid = abs(float(row["static_resid"]))
+            _out(f"    {i}. {q}  |resid|={resid:.4f}  nodes={int(row['n_nodes'])}")
+            _out(f"        Trade: {direction} at node (deadline) {dis_node} (dislocated leg, 1 unit)")
+            hw = row.get("hedge_weights_by_deadline")
+            if hw is not None and isinstance(hw, dict):
+                parts = [f"{d}: w={w:+.3f}" for d, w in sorted(hw.items())]
+                _out(f"        Hedge weights by deadline: {', '.join(parts)}")
+            elif hw is not None and isinstance(hw, str):
+                try:
+                    hwd = json.loads(hw)
+                    parts = [f"{d}: w={float(w):+.3f}" for d, w in sorted(hwd.items())]
+                    _out(f"        Hedge weights by deadline: {', '.join(parts)}")
+                except (json.JSONDecodeError, TypeError):
+                    _out(f"        Hedge: {hw}")
+            # Dollar opportunity: size within 1c of top of book, exit at EXIT_THRESHOLD
+            if i <= len(opportunity_per_candidate):
+                opp = opportunity_per_candidate[i - 1]
+                max_sh = opp.get("max_shares", 0.0)
+                entry_p = opp.get("entry_price_dis")
+                gross = opp.get("est_gross_dollars", 0.0)
+                if entry_p is not None:
+                    _out(f"        Opportunity: max_shares={max_sh:.1f} (within 1c of top)  entry_dis={entry_p:.3f}  est_gross_dollars=${gross:.2f} (exit when |resid|<{EXIT_THRESHOLD})")
+                else:
+                    _out(f"        Opportunity: max_shares={max_sh:.1f}  est_gross_dollars=${gross:.2f} (exit when |resid|<{EXIT_THRESHOLD})")
+            else:
+                _out("        Opportunity: N/A (run with --execute-live for tradeable size)")
         if len(candidates) > 15:
             _out(f"    ... and {len(candidates) - 15} more")
     else:
@@ -734,15 +833,32 @@ def run_once(execute_live: bool = False) -> pd.DataFrame:
                 f"shares={float(row['executed_shares']):.2f}  {details}"
             )
     if balance:
-        _out(f"  balance: {balance}")
-    _out(f"  logs: {CYCLE_LOG_PATH} | {EXECUTION_LOG_PATH} | execution_attempts_latest.csv")
+        _out(f"  Account balance: {balance}")
+        # PnL since process start (when we have numeric balance)
+        current = None
+        if isinstance(balance, dict) and "error" not in balance:
+            for key in ("balance", "amount", "size"):
+                raw = balance.get(key)
+                if raw is not None:
+                    try:
+                        current = float(raw)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        if current is not None:
+            global _start_balance
+            if _start_balance is None:
+                _start_balance = current
+            pnl = current - _start_balance
+            _out(f"  Strategy PnL (since process start): ${pnl:+.2f} USDC")
+    _out(f"  logs: {CYCLE_LOG_PATH} | {EXECUTION_LOG_PATH}" + (f" | {EXECUTION_ATTEMPTS_PATH}" if not executed.empty else ""))
     _out()
     return candidates
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fast live signal runner (no backtest rerun).")
-    parser.add_argument("--loop-seconds", type=int, default=0, help="Run continuously every N seconds.")
+    parser.add_argument("--loop-seconds", type=int, default=300, help="Run continuously every N seconds. Use 0 to run once and exit.")
     parser.add_argument(
         "--execute-live",
         action="store_true",
